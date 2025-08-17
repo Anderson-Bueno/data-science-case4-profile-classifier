@@ -1,0 +1,11 @@
+🎯 Problema que a publicação resolve
+
+Empresas que segmentam clientes em perfis comportamentais (como fizemos nos Cases anteriores com clusterização e tracking) enfrentam um desafio:
+
+Como usar esses perfis em produção para prever o perfil de novos clientes ou transações futuras?
+
+Sem um modelo supervisionado, cada novo cliente teria que passar novamente por um pipeline inteiro de clustering — caro, demorado e instável.
+
+Ou seja, o problema é:
+
+👉 Precisamos de um classificador robusto que aprenda com os perfis históricos e consiga prever automaticamente o perfil de um novo cliente, garantindo rapidez, escalabilidade e precisão.
