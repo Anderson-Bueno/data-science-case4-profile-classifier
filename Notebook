@@ -1,0 +1,550 @@
+# Databricks notebook source
+# ============================
+# Case 4 — Classificador Supervisionado de Perfis
+# ============================
+
+# === 0) Config e Imports ===
+import os
+import datetime
+import logging
+import numpy as np
+import pandas as pd
+
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import (
+    col, lit, mean, stddev, count, min, exp, log1p, pow, datediff, current_date,
+    to_date
+)
+import pyspark.sql.functions as F
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.metrics import (
+    classification_report, cohen_kappa_score, precision_score, recall_score,
+    f1_score, confusion_matrix, roc_auc_score
+)
+from sklearn.covariance import MinCovDet
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from scipy.spatial import distance
+from scipy.spatial.distance import jensenshannon
+from scipy.stats import zscore, skew, kurtosis, entropy
+from dateutil.relativedelta import relativedelta
+
+import matplotlib.pyplot as plt
+import mlflow
+
+# (opcional) caminho customizado para seus módulos locais
+import sys
+sys.path.append("/Workspace/Users")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("case4-classifier")
+
+# === 1) Parâmetros do Notebook ===
+PARQUET_PATH = "dbfs:/FileStore/shared_uploads/data.parquet"
+OUTPUT_DIR_DBFS = "/dbfs/mnt/perfis/output_case4"        # salva outputs (parquet + gráficos)
+USE_EXISTING_TRACK_OUTPUT = False                        # se True, tenta ler rótulos já salvos; senão, roda tracking
+N_CLUSTERS_DYNAMIC = 5
+MONTHS_PER_WINDOW = 1
+RANDOM_STATE = 42
+
+# === 2) Utilidades Base ===
+def print_df_diagnostics(df: DataFrame, spark_obj_name: str = "df"):
+    try:
+        total = df.count()
+        logger.info(f"[INFO] Total de linhas em {spark_obj_name}: {total}")
+        logger.info(f"[INFO] Schema de {spark_obj_name}:")
+        df.printSchema()
+        logger.info(f"[INFO] Amostra de {spark_obj_name}:")
+        df.show(5)
+    except Exception as e:
+        logger.error(f"[ERRO] ao inspecionar {spark_obj_name}: {e}")
+
+def validate_input_dataframe(df: DataFrame, required_columns: list) -> None:
+    missing = [c for c in required_columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"Colunas ausentes no DataFrame: {missing}")
+
+    sample = df.limit(1000).toPandas()
+    null_ratios = sample.isnull().mean()
+    logger.info("[VALIDAÇÃO] % de nulos (colunas com nulos):")
+    has_null = null_ratios[null_ratios > 0].round(3)
+    if len(has_null):
+        logger.info(has_null.to_string())
+    else:
+        logger.info("Sem nulos na amostra.")
+
+    numeric_cols = sample.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols):
+        zscores = np.abs(zscore(sample[numeric_cols], nan_policy='omit'))
+        if zscores.ndim == 2:
+            outlier_count = (zscores > 3).sum(axis=0)
+            logger.info("[VALIDAÇÃO] Outliers por numérica:")
+            logger.info(dict(zip(numeric_cols, outlier_count)))
+
+def generate_time_windows(start_date: datetime.date, end_date: datetime.date, months_per_window: int = 1):
+    windows = []
+    current_end = end_date
+    while current_end > start_date:
+        current_start = current_end - relativedelta(months=months_per_window)
+        windows.append((current_start, current_end))
+        current_end = current_start
+    return list(reversed(windows))
+
+# === 3) Feature Engineering (Spark) ===
+def calculateAttributes_v4(df: DataFrame,
+                           cliente_id_col: str = "idcliente",
+                           data_col: str = "dataconsumo",
+                           qtd_col: str = "quantidade",
+                           valor_col: str = "valorunitario",
+                           produto_col: str = "produto") -> DataFrame:
+    df = df.withColumn("data_diff", datediff(current_date(), col(data_col)))
+    df = df.withColumn("recency_score", exp(-0.01 * col("data_diff")))
+    df = df.withColumn("ticket", col(qtd_col) * col(valor_col))
+    df = df.withColumn("log_ticket", log1p(col("ticket")))
+    df = df.withColumn("qtd2", pow(col(qtd_col), 2))
+
+    agg_exprs = [
+        count("*").alias("frequencia_total"),
+        mean("ticket").alias("ticket_medio"),
+        stddev("ticket").alias("ticket_std"),
+        mean("log_ticket").alias("ticket_log_medio"),
+        mean("qtd2").alias("qtd_quadrado_medio"),
+        mean(qtd_col).alias("quantidade_media"),
+        stddev(qtd_col).alias("quantidade_std"),
+        mean("recency_score").alias("recencia_exponencial"),
+        min("data_diff").alias("tempo_ultima_compra_dias")
+    ]
+    if produto_col and produto_col in df.columns:
+        agg_exprs.append(count(produto_col).alias("produtos_distintos"))
+    return df.groupBy(cliente_id_col).agg(*agg_exprs)
+
+def choose_n_components(X: pd.DataFrame, threshold: float = 0.95) -> int:
+    pca_temp = PCA(n_components=min(X.shape[1], X.shape[0]))
+    pca_temp.fit(X)
+    cumulative_variance = np.cumsum(pca_temp.explained_variance_ratio_)
+    return int(np.argmax(cumulative_variance >= threshold) + 1)
+
+def calculate_weight_score_v2(df_features: pd.DataFrame, variance_threshold: float = 0.95):
+    df_out = df_features.copy()
+    feature_cols = [c for c in df_out.columns if c != 'idcliente']
+    X = df_out[feature_cols].values
+
+    # estatísticas (opcional para relatório)
+    _ = {
+        "variavel": feature_cols,
+        "skewness": [skew(X[:, i]) for i in range(X.shape[1])],
+        "kurtosis": [kurtosis(X[:, i]) for i in range(X.shape[1])]
+    }
+
+    pca = PCA(n_components=choose_n_components(pd.DataFrame(X, columns=feature_cols), threshold=variance_threshold))
+    X_pca = pca.fit_transform(X)
+    df_out["pca_score"] = X_pca[:, 0]
+    return df_out[["idcliente", "pca_score"]]
+
+def calculateProbabilisticProfiles(df_features: pd.DataFrame,
+                                   perfil_centroids: pd.DataFrame,
+                                   robust: bool = True,
+                                   regularization_epsilon: float = 1e-3,
+                                   alpha: float = 1.0) -> pd.DataFrame:
+    feature_cols = [c for c in df_features.columns if c != 'idcliente']
+    X = df_features[feature_cols].values
+    cov_inv = None
+    try:
+        if robust:
+            mcd = MinCovDet().fit(X)
+            cov = mcd.covariance_
+        else:
+            cov = np.cov(X.T)
+        cov += np.eye(cov.shape[0]) * regularization_epsilon
+        cov_inv = np.linalg.inv(cov)
+    except Exception:
+        logger.warning("[AVISO] Fallback para distância Euclidiana.")
+
+    results = []
+    for _, row in df_features.iterrows():
+        cliente_id = row["idcliente"]
+        x = row[feature_cols].values.astype(float)
+        dists = []
+        for perfil in perfil_centroids.index:
+            mu = perfil_centroids.loc[perfil].values.astype(float)
+            try:
+                dist = distance.mahalanobis(x, mu, cov_inv) if cov_inv is not None else np.linalg.norm(x - mu)
+            except Exception:
+                dist = np.linalg.norm(x - mu)
+            dists.append((perfil, dist))
+        d_array = np.array([d for _, d in dists])
+        scores = np.exp(-alpha * d_array)
+        probs = scores / scores.sum()
+        result = {"idcliente": cliente_id, "perfil_estimado": dists[np.argmin(d_array)][0]}
+        for i, (perfil, _) in enumerate(dists):
+            result[f"prob_{perfil}"] = float(probs[i])
+        results.append(result)
+    return pd.DataFrame(results)
+
+def cluster_dynamic_profiles(df_features: pd.DataFrame, n_clusters: int = 5) -> pd.DataFrame:
+    features = df_features.drop(columns=["idcliente"])
+    pca = PCA(n_components=3)
+    reduced = pca.fit_transform(features)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=RANDOM_STATE)
+    clusters = kmeans.fit_predict(reduced)
+    df_result = df_features[["idcliente"]].copy()
+    df_result["perfil_clusterizado"] = clusters
+    return df_result
+
+def analyze_profile_stability(df_all: pd.DataFrame) -> pd.DataFrame:
+    df_all_sorted = df_all.sort_values(by=["idcliente", "janela_inicio"])
+    summary = []
+    for cliente_id, group in df_all_sorted.groupby("idcliente"):
+        perfis = group["perfil_estimado"].tolist()
+        transicoes = sum([1 for i in range(1, len(perfis)) if perfis[i] != perfis[i - 1]])
+        perfil_dominante = max(set(perfis), key=perfis.count)
+        estabilidade = perfis.count(perfil_dominante) / len(perfis)
+        summary.append({
+            "idcliente": cliente_id,
+            "perfil_dominante": perfil_dominante,
+            "qtd_transicoes": transicoes,
+            "estabilidade_percentual": round(estabilidade * 100, 2)
+        })
+    return pd.DataFrame(summary)
+
+def resumir_perfil_cliente(group: pd.DataFrame, cliente_id: str) -> dict:
+    perfis = group["perfil_estimado"].tolist()
+    perfil_dominante = max(set(perfis), key=perfis.count)
+    transicoes = sum([1 for i in range(1, len(perfis)) if perfis[i] != perfis[i - 1]])
+    jaccard = len(set(perfis)) / len(perfis) if len(perfis) > 0 else 0
+    prob_cols = [c for c in group.columns if c.startswith("prob_")]
+    prob_means = group[prob_cols].mean().to_dict() if len(prob_cols) else {}
+    entropias = group[prob_cols].apply(lambda row: entropy(row + 1e-9), axis=1) if len(prob_cols) else pd.Series([0.0])
+    entropia_media = entropias.mean() if len(entropias) else 0.0
+    row = {
+        "idcliente": cliente_id,
+        "perfil_final": perfil_dominante,
+        "qtd_transicoes": transicoes,
+        "jaccard_estabilidade": round(jaccard, 3),
+        "entropia_media": round(entropia_media, 3)
+    }
+    row.update({f"media_{k}": round(v, 3) for k, v in prob_means.items()})
+    return row
+
+def prepare_input_layers(spark_df: DataFrame,
+                         numerical_cols: list,
+                         categorical_cols: list,
+                         raw_cols: list):
+    """
+    Stub simplificado: retorna (df_model_input, df_model_staging)
+    Você pode substituir por sua versão do pipeline_preprocessing.
+    """
+    # staging = apenas colunas necessárias e coerção de tipos mínimos
+    staging = spark_df.select(*raw_cols)
+    # model_input = agregados por cliente (features finais)
+    features_spark = calculateAttributes_v4(staging,
+                                            cliente_id_col="idcliente",
+                                            data_col="dataconsumo",
+                                            qtd_col="quantidade",
+                                            valor_col="valorunitario",
+                                            produto_col="produto")
+    return features_spark, staging
+
+def track_profiles_over_time(spark_df,
+                             numerical_cols,
+                             categorical_cols,
+                             raw_cols,
+                             perfil_centroids,
+                             cliente_id_col="idcliente",
+                             data_col="dataconsumo",
+                             months_per_window=1):
+    validate_input_dataframe(spark_df, required_columns=raw_cols)
+
+    # Layers
+    df_model_input_spark, df_model_staging = prepare_input_layers(spark_df, numerical_cols, categorical_cols, raw_cols)
+    df_model_input = df_model_input_spark.toPandas()
+
+    # Min/Max datas (Spark -> Python date, sem .date() redundante)
+    min_dt = df_model_staging.select(F.min(col(data_col))).first()[0]
+    max_dt = df_model_staging.select(F.max(col(data_col))).first()[0]
+    if isinstance(min_dt, datetime.datetime): min_dt = min_dt.date()
+    if isinstance(max_dt, datetime.datetime): max_dt = max_dt.date()
+    if not isinstance(min_dt, datetime.date) or not isinstance(max_dt, datetime.date):
+        raise ValueError("Falha ao extrair min/max de datas. Verifique o tipo de 'dataconsumo'.")
+
+    time_windows = generate_time_windows(min_dt, max_dt, months_per_window)
+    logger.info(f"[DEBUG] janelas: {time_windows}")
+
+    results = []
+    df_score_cached = None
+    df_cluster_cached = None
+
+    for start, end in time_windows:
+        logger.info(f"[INFO] janela: {start} -> {end}")
+        df_window = df_model_staging.filter(
+            (col(data_col) >= lit(str(start))) & (col(data_col) < lit(str(end)))
+        )
+        if df_window.count() == 0:
+            continue
+
+        df_features_spark = calculateAttributes_v4(df_window, cliente_id_col=cliente_id_col, data_col=data_col)
+        df_features_pd = df_features_spark.toPandas()
+
+        # PCA score
+        df_score = calculate_weight_score_v2(df_features_pd)
+        df_score_cached = df_score
+
+        # Probabilístico
+        df_prob = calculateProbabilisticProfiles(df_features_pd, perfil_centroids)
+        df_prob["janela_inicio"] = str(start)
+        df_prob["janela_fim"] = str(end)
+
+        # Cluster dinâmico (para relatório/visual)
+        df_cluster = cluster_dynamic_profiles(df_features_pd, n_clusters=N_CLUSTERS_DYNAMIC)
+        df_cluster_cached = df_cluster
+
+        df_prob = df_prob.merge(df_cluster, on="idcliente", how="left")
+        df_prob = df_prob.merge(df_score, on="idcliente", how="left")
+        results.append(df_prob)
+
+    if results:
+        df_all = pd.concat(results, ignore_index=True)
+        df_stability = analyze_profile_stability(df_all)
+        df_final = pd.DataFrame([
+            resumir_perfil_cliente(group, cliente_id)
+            for cliente_id, group in df_all.sort_values(by=["idcliente", "janela_inicio"]).groupby("idcliente")
+        ])
+        # features finais (uma linha por cliente)
+        if (df_score_cached is not None) and (df_cluster_cached is not None):
+            df_features_union = df_score_cached.merge(df_cluster_cached, on="idcliente", how="outer")
+        else:
+            df_features_union = df_model_input.copy()  # fallback
+    else:
+        logger.warning("[AVISO] Nenhum resultado em results.")
+        df_all = pd.DataFrame()
+        df_stability = pd.DataFrame()
+        df_final = pd.DataFrame()
+        df_features_union = pd.DataFrame()
+
+    return df_all, df_stability, df_final, df_features_union
+
+def save_outputs_to_parquet(df_all, df_stability, df_final, path: str):
+    os.makedirs(path, exist_ok=True)
+    if len(df_all):        pd.DataFrame(df_all).to_parquet(f"{path}/df_all.parquet", index=False)
+    if len(df_stability):  pd.DataFrame(df_stability).to_parquet(f"{path}/df_stability.parquet", index=False)
+    if len(df_final):      pd.DataFrame(df_final).to_parquet(f"{path}/df_final.parquet", index=False)
+    logger.info(f"[OUTPUT] salvos em: {path}")
+
+# === 4) Leitura de dados brutos e preparação mínima ===
+raw_df = spark.read.parquet(PARQUET_PATH)
+# garante tipo date (sem timezone)
+raw_df = raw_df.withColumn("dataconsumo", to_date(col("dataconsumo")))
+print_df_diagnostics(raw_df, "raw_df")
+
+numerical_cols = ["quantidade", "valorunitario"]
+categorical_cols = ["produto"]
+raw_cols = ["idcliente", "dataconsumo", "quantidade", "valorunitario", "produto"]
+
+# Centroides temporários (ajuste conforme seu clustering real)
+perfil_centroids = pd.DataFrame({
+    "frequencia_total": [1, 10],
+    "ticket_medio": [10.0, 100.0],
+    "quantidade_media": [1, 5],
+    "ticket_std": [5.0, 20.0],
+    "quantidade_std": [0.5, 3.0],
+    "recencia_exponencial": [0.1, 0.9],
+    "tempo_ultima_compra_dias": [200, 5],
+    "ticket_log_medio": [2.3, 4.5],
+    "qtd_quadrado_medio": [1.5, 25]
+}, index=["perfil_1", "perfil_2"])
+
+# === 5) Geração (ou leitura) dos rótulos de perfil
+if USE_EXISTING_TRACK_OUTPUT and os.path.exists(f"{OUTPUT_DIR_DBFS}/df_final.parquet"):
+    logger.info("[INFO] Carregando saídas existentes...")
+    df_final = pd.read_parquet(f"{OUTPUT_DIR_DBFS}/df_final.parquet")
+    # Se quiser reusar features_union previamente salvas, basta carregar aqui.
+    # Caso contrário, vamos recomputar features rapidamente:
+    features_spark, staging = prepare_input_layers(raw_df, numerical_cols, categorical_cols, raw_cols)
+    df_features_union = calculate_weight_score_v2(features_spark.toPandas())
+    df_features_union = df_features_union.merge(
+        cluster_dynamic_profiles(features_spark.toPandas()), on="idcliente", how="left"
+    )
+else:
+    logger.info("[INFO] Rodando tracking para gerar rótulos...")
+    df_all, df_stability, df_final, df_features_union = track_profiles_over_time(
+        spark_df=raw_df,
+        numerical_cols=numerical_cols,
+        categorical_cols=categorical_cols,
+        raw_cols=raw_cols,
+        perfil_centroids=perfil_centroids,
+        cliente_id_col="idcliente",
+        data_col="dataconsumo",
+        months_per_window=MONTHS_PER_WINDOW
+    )
+    save_outputs_to_parquet(df_all, df_stability, df_final, OUTPUT_DIR_DBFS)
+
+# === 6) Montagem do dataset supervisionado ===
+# Junte rótulos finais (perfil_final) às features agregadas por cliente
+if "perfil_final" not in df_final.columns:
+    raise ValueError("df_final não contém a coluna 'perfil_final'. Verifique o pipeline anterior.")
+
+df_supervised = df_features_union.merge(
+    df_final[["idcliente", "perfil_final"]],
+    on="idcliente",
+    how="inner"
+)
+
+# Remove colunas não numéricas e id
+X = df_supervised.drop(columns=["idcliente", "perfil_final"])
+y = df_supervised["perfil_final"]
+
+# Split estratificado
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+)
+
+# === 7) Treino de Modelos ===
+rf = RandomForestClassifier(
+    n_estimators=300,
+    max_depth=None,
+    random_state=RANDOM_STATE,
+    n_jobs=-1
+)
+lr = LogisticRegression(
+    max_iter=1000,
+    multi_class="ovr",
+    n_jobs=-1
+)
+
+rf.fit(X_train, y_train)
+lr.fit(X_train, y_train)
+
+# Predições
+y_pred_rf = rf.predict(X_test)
+y_pred_lr = lr.predict(X_test)
+
+# Probabilidades para ROC
+y_proba_rf = rf.predict_proba(X_test)
+y_proba_lr = lr.predict_proba(X_test)
+
+# === 8) Métricas ===
+def eval_and_print(name, y_true, y_pred, y_proba, labels):
+    kappa = cohen_kappa_score(y_true, y_pred)
+    f1_macro = f1_score(y_true, y_pred, average="macro")
+    f1_weighted = f1_score(y_true, y_pred, average="weighted")
+    prec = precision_score(y_true, y_pred, average="macro")
+    rec = recall_score(y_true, y_pred, average="macro")
+    logger.info(f"\n[{name}] Cohen Kappa: {kappa:.3f}")
+    logger.info(f"[{name}] F1-macro: {f1_macro:.3f} | F1-weighted: {f1_weighted:.3f}")
+    logger.info(f"[{name}] Precision-macro: {prec:.3f} | Recall-macro: {rec:.3f}")
+    logger.info(f"\n[{name}] Classification Report:\n{classification_report(y_true, y_pred)}")
+
+    # ROC-AUC (multiclasse ovr)
+    lb = LabelBinarizer()
+    y_true_bin = lb.fit_transform(y_true)
+    # Reordena proba para o mesmo order dos labels do binarizer, se necessário
+    classes_order = list(lb.classes_)
+    # mapeia colunas de predict_proba para a ordem dos classes_order
+    # (scikit já retorna na ordem clf.classes_, mas garantimos)
+    if list(labels) != classes_order:
+        col_index = [list(labels).index(c) for c in classes_order]
+        y_proba = y_proba[:, col_index]
+    try:
+        roc_auc = roc_auc_score(y_true_bin, y_proba, multi_class="ovr")
+        logger.info(f"[{name}] ROC-AUC (ovr): {roc_auc:.3f}")
+    except Exception as e:
+        logger.warning(f"[{name}] ROC-AUC não pôde ser calculado: {e}")
+
+eval_and_print("RandomForest", y_test, y_pred_rf, y_proba_rf, rf.classes_)
+eval_and_print("LogReg",       y_test, y_pred_lr, y_proba_lr, lr.classes_)
+
+# === 9) Gráficos (ROC, Matriz de Confusão, Feature Importance) ===
+os.makedirs(OUTPUT_DIR_DBFS, exist_ok=True)
+
+# Matriz de confusão normalizada (RF)
+cm = confusion_matrix(y_test, y_pred_rf, labels=rf.classes_)
+cm_norm = cm / cm.sum(axis=1, keepdims=True)
+
+plt.figure(figsize=(6,5))
+plt.imshow(cm_norm, interpolation="nearest")
+plt.title("Confusion Matrix (Normalized) - RF")
+plt.colorbar()
+tick_marks = np.arange(len(rf.classes_))
+plt.xticks(tick_marks, rf.classes_, rotation=45, ha="right")
+plt.yticks(tick_marks, rf.classes_)
+plt.xlabel("Predito")
+plt.ylabel("Verdadeiro")
+for i in range(cm_norm.shape[0]):
+    for j in range(cm_norm.shape[1]):
+        plt.text(j, i, f"{cm_norm[i, j]:.2f}", ha="center", va="center")
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR_DBFS}/cm_rf.png", dpi=150)
+plt.close()
+
+# ROC (one-vs-rest) RF
+lb = LabelBinarizer()
+y_true_bin = lb.fit_transform(y_test)
+classes_order = list(lb.classes_)
+# alinhar proba
+if list(rf.classes_) != classes_order:
+    col_index = [list(rf.classes_).index(c) for c in classes_order]
+    y_proba_rf_plot = y_proba_rf[:, col_index]
+else:
+    y_proba_rf_plot = y_proba_rf
+
+from sklearn.metrics import roc_curve, auc
+plt.figure(figsize=(6,5))
+for i, cls in enumerate(classes_order):
+    if y_true_bin[:, i].sum() == 0:
+        continue
+    fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_proba_rf_plot[:, i])
+    plt.plot(fpr, tpr, label=f"Classe {cls} (AUC={auc(fpr,tpr):.2f})")
+plt.plot([0,1], [0,1], linestyle="--")
+plt.xlabel("FPR")
+plt.ylabel("TPR")
+plt.title("ROC (One-vs-Rest) - RF")
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR_DBFS}/roc_rf.png", dpi=150)
+plt.close()
+
+# Feature importance (RF)
+importances = rf.feature_importances_
+indices = np.argsort(importances)[::-1]
+feat_names = X.columns[indices][:20]
+feat_vals = importances[indices][:20]
+
+plt.figure(figsize=(7,6))
+plt.barh(range(len(feat_vals))[::-1], feat_vals[::-1])
+plt.yticks(range(len(feat_names))[::-1], feat_names[::-1])
+plt.title("Feature Importance - RF (Top 20)")
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR_DBFS}/fi_rf.png", dpi=150)
+plt.close()
+
+logger.info(f"[PLOTS] salvos em {OUTPUT_DIR_DBFS}")
+
+# === 10) MLflow (opcional) ===
+mlflow.set_experiment("/Shared/Case4_Perfil_Classifier")
+with mlflow.start_run(run_name="RF_vs_LR"):
+    # métricas chave RF
+    mlflow.log_metric("rf_kappa", float(cohen_kappa_score(y_test, y_pred_rf)))
+    mlflow.log_metric("rf_f1_macro", float(f1_score(y_test, y_pred_rf, average="macro")))
+    mlflow.log_metric("rf_f1_weighted", float(f1_score(y_test, y_pred_rf, average="weighted")))
+    # métricas chave LR
+    mlflow.log_metric("lr_kappa", float(cohen_kappa_score(y_test, y_pred_lr)))
+    mlflow.log_metric("lr_f1_macro", float(f1_score(y_test, y_pred_lr, average="macro")))
+    mlflow.log_metric("lr_f1_weighted", float(f1_score(y_test, y_pred_lr, average="weighted")))
+    # artefatos
+    mlflow.log_artifact(f"{OUTPUT_DIR_DBFS}/cm_rf.png")
+    mlflow.log_artifact(f"{OUTPUT_DIR_DBFS}/roc_rf.png")
+    mlflow.log_artifact(f"{OUTPUT_DIR_DBFS}/fi_rf.png")
+    # parâmetros e modelo
+    mlflow.log_params({"n_estimators": 300, "random_state": RANDOM_STATE})
+    mlflow.sklearn.log_model(rf, artifact_path="rf_model")
+    mlflow.sklearn.log_model(lr, artifact_path="lr_model")
+
+logger.info("[MLflow] execução registrada.")
+
+# === 11) Saída final
+logger.info("[OK] Case 4 executado com sucesso.")
+print("Arquivos salvos em:", OUTPUT_DIR_DBFS)
