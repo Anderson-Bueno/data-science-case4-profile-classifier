@@ -1,0 +1,69 @@
+Projeções de Cenários com os Outputs do Case 4
+
+1. Cenário Descritivo – Diagnóstico do Modelo
+
+O que já conseguimos enxergar
+
+Distribuição real vs. prevista dos perfis → mostra onde o modelo acerta mais e onde ainda confunde perfis próximos.
+Importância das variáveis (feature importance) → evidencia quais atributos realmente definem comportamento, exemplo: frequência maior que ticket médio.
+
+Projeção
+
+Evolução do modelo supervisionado como radar contínuo de novos padrões.
+
+
+2. Cenário Preditivo – Classificação em Produção
+
+O que o modelo entrega
+
+Para cada novo cliente (ou transação), temos imediatamente uma previsão de perfil.
+
+Projeção
+
+Escalabilidade → não é preciso rodar todo o pipeline de clusterização novamente.
+Automação de campanhas de marketing (recomendação, upsell, retenção) baseada no perfil mais provável.
+Detecção de mudança de perfil em tempo quase real, útil para churn prediction.
+
+
+3. Cenário Prescritivo – Ações Acionáveis
+
+Saída do modelo e métricas de confiança podem alimentar
+
+Sistemas de CRM → direcionar mensagens diferentes conforme o perfil previsto.
+Gestão de estoque → prever demanda futura por perfil dominante.
+Pricing dinâmico → associar sensibilidade de preço ao tipo de perfil previsto.
+
+Projeção
+
+Reduzir CAC (Custo de Aquisição de Clientes) e aumentar LTV (Lifetime Value).
+
+
+4. Cenário de Inferência Causal – Estratégia de Negócio
+
+Estimativas de efeitos causais
+
+Ao cruzar predições de perfis ao longo do tempo com campanhas realizadas, conseguimos estimar impactos.
+Exemplo: campanha X aumentou a probabilidade de clientes do perfil Explorador migrarem para Construtor Fiel.
+
+Projeção
+
+Geração de insights causais que fundamentam decisões estratégicas de longo prazo, indicando quais campanhas ou mudanças operacionais realmente transformam comportamento.
+
+
+5. Cenário Operacional – Monitoramento em Tempo Real
+
+Outputs (predição e probabilidade) podem ser registrados em
+
+Painéis de monitoramento no Databricks ou PowerBI.
+
+Projeção
+
+Acompanhamento contínuo do health da base de clientes.
+Se a proporção de um perfil cresce ou decresce de forma abrupta → alerta para decisão imediata.
+
+
+Resumo Executivo
+
+Com o Case 4, saímos de um pipeline exploratório (descoberta de perfis via clusterização) para um pipeline operacional (classificação automática, interpretável e escalável).
+
+As projeções abrangem desde diagnóstico técnico (feature importance, ROC) até ações estratégicas (recomendação, retenção, inferência causal).
