@@ -1,0 +1,49 @@
+# 🎯 Problema antes do Case 4
+
+Nos Cases anteriores (1 a 3), conseguimos:
+
+Segmentar clientes em perfis comportamentais latentes (via clusterização RFMT + PCA).
+Realizar matching probabilístico para identificar o perfil mais provável de um novo cliente.
+Trackear a evolução temporal de clientes entre perfis.
+
+👉 Porém, até aqui tudo estava não supervisionado (sem rótulos explícitos).
+Isso dificultava:
+
+Aplicar modelos rápidos em produção para **classificar novos clientes em tempo real.
+Avaliar com métricas robustas (ex.: F1-score, Kappa, AUC-ROC) a qualidade do reconhecimento de perfis.
+Entender **quais variáveis (features) realmente diferenciam os perfis (explicabilidade).
+
+
+
+ ✅ Solução com o Case 4: Classificador Supervisionado de Perfis
+
+1. Transformação dos perfis latentes em rótulos supervisionados:
+
+   Usamos os clusters/labels dos Cases anteriores como *ground truth*.
+   Esses rótulos viram a base para treinamento supervisionado.
+
+2. Treinamento de um modelo supervisionado robusto (Random Forest):
+
+   Classifica clientes em perfis já definidos.
+   Suporta deploy em **tempo real** (predict API ou batch scoring).
+
+3. Relatório com métricas de classificação:
+
+   F1-score e Kappa → consistência na classificação de perfis.
+   Curva ROC-AUC → capacidade discriminativa do modelo.
+
+4. Feature Importance:
+
+   Identificamos variáveis que mais contribuem para diferenciar perfis (ex.: ticket médio, frequência, categoria dominante).
+   Isso dá explicabilidade para o negócio e direciona estratégias de marketing.
+
+
+## 🚀 Impacto/Resultado
+
+Escalabilidade: agora conseguimos classificar **milhões de clientes em segundos.
+Monitoramento contínuo: métricas supervisionadas permitem auditar se o modelo continua performando bem com novos dados.
+Ação estratégica: área de negócio pode priorizar variáveis mais relevantes na diferenciação de clientes.
+
+
+👉 Resumindo em uma frase curta (para publicação):
+O Case 4 resolveu o desafio de transformar perfis latentes (não supervisionados) em um classificador supervisionado robusto, escalável e explicável — capaz de atribuir qualquer novo cliente a um perfil com alta precisão.
