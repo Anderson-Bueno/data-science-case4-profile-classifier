@@ -1,0 +1,39 @@
+🛠️ Meios aplicados para chegar à solução
+
+No Case 4, resolvemos esse problema aplicando aprendizado supervisionado:
+
+Construção da base de treino
+
+Usamos os perfis gerados via clusterização (Cases 1–3) como rótulos (labels).
+
+Features: RFMT (Recência, Frequência, Monetário, Ticket), atributos derivados (mix de categorias, diversidade, concentração).
+
+Modelagem supervisionada
+
+Algoritmo: Random Forest Classifier (robusto a colinearidade, interpretável, baseline forte).
+
+Outras opções possíveis: Gradient Boosted Trees, XGBoost, LightGBM (fica como extensão futura).
+
+Avaliação de desempenho
+
+Métricas:
+
+Kappa de Cohen (consistência além do acaso).
+
+F1-Score Macro (equilíbrio entre classes desbalanceadas).
+
+Curva ROC-AUC (capacidade discriminativa).
+
+Relatórios automáticos com classification_report.
+
+Interpretação
+
+Feature importance da Random Forest para explicar quais variáveis mais pesam na definição de perfis (ex: ticket médio, frequência, mix de categorias).
+
+Visualizações (barplots, curvas ROC, matriz de confusão).
+
+Produção e reuso
+
+O modelo treinado pode ser salvo no MLflow (Databricks) ou GitHub (versão open).
+
+Novos clientes são classificados diretamente sem passar pelo pipeline inteiro de clusterização.
